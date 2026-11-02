@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -9,12 +12,23 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// Архитектура: loop() (ядро 1) занимается только экраном и кнопками.
+// Вся сеть (Wi-Fi, NTP, HTTPS-запросы) живёт в отдельной задаче netTask (ядро 0).
+// Сетевая задача ничего не рисует и не трогает общие данные, пока качает:
+// сначала всё складывает в локальные буферы, а в общие данные пишет
+// коротко, под мьютексом, когда загрузка уже закончена.
+
 const char* WIFI_SSID = "Wokwi-GUEST";
 const char* WIFI_PASS = "";
 
-#define BTN_NEXT 4
-#define BTN_VIEW 5
-#define BTN_PREV 18
+// большие кнопки
+#define BTN_NEXT 4       // следующая валюта
+#define BTN_PREV 18      // предыдущая валюта
+#define BTN_VIEW 5       // режим: курс -> график -> конвертер
+// маленькие кнопки
+#define BTN_UP 19        // сумма в конвертере больше
+#define BTN_DOWN 23      // сумма в конвертере меньше
+#define BTN_STATUS 25    // экран статуса
 #define NC 10
 #define N 7
 #define LIVE_MS (30UL * 1000UL)
@@ -55,10 +69,27 @@ Asset assets[NC] = {
 int curIdx = 0;
 
 enum ViewMode { VIEW_RATE, VIEW_CHART, VIEW_CONV };
-enum Busy { BUSY_NONE, BUSY_LIVE, BUSY_HIST };
+enum Busy { BUSY_NONE, BUSY_WIFI, BUSY_LIVE, BUSY_HIST };
 
 ViewMode viewMode = VIEW_RATE;
-Busy busy = BUSY_NONE;
+
+// --- общее состояние между экраном и сетевой задачей ---
+SemaphoreHandle_t dataMux;                 // защищает assets, dateOld/New, lastUpdate, *OkMs
+#define LOCK()   xSemaphoreTake(dataMux, portMAX_DELAY)
+#define UNLOCK() xSemaphoreGive(dataMux)
+
+volatile Busy busy = BUSY_NONE;            // что сейчас делает сеть
+volatile bool dataDirty = false;           // сеть просит перерисовать экран
+volatile bool liveFail = false;
+volatile bool histFail = false;
+volatile uint8_t liveSrc = 0;              // откуда последний живой курс: 1 = CoinGecko, 2 = Binance
+volatile int histProgress = 0;             // сколько дней истории уже загружено
+volatile uint32_t lastLive = 0;            // когда сеть начала последнее живое обновление
+
+bool haveCache = false;                    // выставляется в setup() до старта сети
+uint32_t cacheEpoch = 0;
+
+bool dotShown = false;                     // мигающая точка "идёт загрузка"
 
 bool showStatus = false;
 uint32_t lastStatusDraw = 0;
@@ -70,12 +101,11 @@ const long CONV_AMOUNTS[] = {1, 10, 50, 100, 500, 1000, 5000, 10000};
 #define CONV_N ((int)(sizeof(CONV_AMOUNTS) / sizeof(CONV_AMOUNTS[0])))
 
 int convAmtIdx = 3;
-bool convRev = false;
 
 void draw();
 bool autoMode = false;
 
-uint32_t lastLive = 0, lastHist = 0, lastInput = 0, lastAuto = 0;
+uint32_t lastInput = 0, lastAuto = 0;
 
 String lastUpdate = "--:--";
 
@@ -121,6 +151,7 @@ String clockStr() {
   return String(b);
 }
 
+// Рисовать на дисплее можно только из loop()/setup(), сетевая задача его не трогает.
 void showMessage(const char* l1, const char* l2 = "") {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -131,20 +162,13 @@ void showMessage(const char* l1, const char* l2 = "") {
   display.display();
 }
 
-void showProgress(const char* label, int cur, int total) {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 18);
-  display.print(label);
-  display.drawRoundRect(0, 32, 128, 12, 3, SSD1306_WHITE);
-  int w = 124 * cur / total;
-  if (w > 0) display.fillRect(2, 34, w, 8, SSD1306_WHITE);
-  char b[16];
-  snprintf(b, sizeof(b), "%d / %d", cur, total);
-  display.setCursor(0, 50);
-  display.print(b);
-  display.display();
+// экран "данных пока нет" (первый запуск без кэша)
+void noData() {
+  char l2[24];
+  if (busy == BUSY_HIST) snprintf(l2, sizeof(l2), "loading %d/%d", (int)histProgress, N);
+  else if (WiFi.status() != WL_CONNECTED) snprintf(l2, sizeof(l2), "connecting WiFi...");
+  else snprintf(l2, sizeof(l2), "wait for update...");
+  showMessage("No data", l2);
 }
 
 void splash() {
@@ -190,12 +214,16 @@ struct Cache {
   char stamp[8];
 };
 
+// вызывается из сетевой задачи: снимок данных копируется под мьютексом,
+// а медленная запись во флеш идёт уже без него
 void saveCache() {
   static Cache c;
   memset(&c, 0, sizeof(c));
   c.magic = CACHE_MAGIC;
   time_t now = time(nullptr);
   c.epoch = now > 1700000000 ? (uint32_t)now : 0;
+
+  LOCK();
   c.count = assets[0].count;
 
   for (int i = 0; i < NC; i++) {
@@ -206,6 +234,7 @@ void saveCache() {
   strlcpy(c.dOld, dateOld, sizeof(c.dOld));
   strlcpy(c.dNew, dateNew, sizeof(c.dNew));
   strlcpy(c.stamp, lastUpdate.c_str(), sizeof(c.stamp));
+  UNLOCK();
 
   if (prefs.begin("rates", false)) {
     prefs.putBytes("c", &c, sizeof(c));
@@ -213,6 +242,7 @@ void saveCache() {
   }
 }
 
+// вызывается только из setup(), до старта сетевой задачи
 bool loadCache(uint32_t& epoch) {
   static Cache c;
   if (!prefs.begin("rates", true)) return false;
@@ -237,6 +267,8 @@ bool loadCache(uint32_t& epoch) {
   return true;
 }
 
+// ================= СЕТЬ (работает в netTask) =================
+
 bool fetchCbr() {
   JsonDocument filter;
   filter["PreviousURL"] = true;
@@ -249,6 +281,7 @@ bool fetchCbr() {
 
   static float vals[NC][N];
   int nom[NC];
+  char dNewL[8] = "", dOldL[8] = "";
 
   for (int i = 0; i < NC; i++) nom[i] = 1;
 
@@ -256,7 +289,8 @@ bool fetchCbr() {
   String url = "https://www.cbr-xml-daily.ru/daily_json.js";
 
   while (got < N && url.length() > 0) {
-    showProgress("Loading history...", got, N);
+    histProgress = got;
+    dataDirty = true;
 
     WiFiClientSecure client;
     client.setInsecure();
@@ -303,11 +337,12 @@ bool fetchCbr() {
     if (d && strlen(d) >= 10) {
       char tmp[8];
       snprintf(tmp, sizeof(tmp), "%.2s.%.2s", d + 8, d + 5);
-      if (got == 0) strlcpy(dateNew, tmp, sizeof(dateNew));
-      strlcpy(dateOld, tmp, sizeof(dateOld));
+      if (got == 0) strlcpy(dNewL, tmp, sizeof(dNewL));
+      strlcpy(dOldL, tmp, sizeof(dOldL));
     }
 
     got++;
+    vTaskDelay(pdMS_TO_TICKS(20));   // отдаём время системным задачам между запросами
 
     const char* prev = doc["PreviousURL"];
     url = prev ? (String("https:") + prev) : String("");
@@ -315,20 +350,26 @@ bool fetchCbr() {
 
   if (got == 0) return false;
 
-  showProgress("Loading history...", got, N);
+  histProgress = got;
 
+  // единственное место, где история попадает в общие данные
+  LOCK();
   for (int i = 0; i < NC; i++) {
     assets[i].nominal = nom[i];
     assets[i].count = got;
     for (int k = 0; k < got; k++)
       assets[i].hist[k] = vals[i][got - 1 - k];
   }
+  strlcpy(dateNew, dNewL, sizeof(dateNew));
+  strlcpy(dateOld, dOldL, sizeof(dateOld));
+  UNLOCK();
 
   Serial.printf("CBR history ok, days: %d\n", got);
   return true;
 }
 
-bool fetchLive() {
+// Источник 1 (приоритетный): CoinGecko. Заполняет nv/ch/hc, в общие данные не пишет.
+bool fetchLiveGecko(float nv[], float ch[], bool hc[]) {
   WiFiClientSecure client;
   client.setInsecure();
 
@@ -360,7 +401,7 @@ bool fetchLive() {
     return false;
   }
 
-  int updated = 0;
+  int any = 0;
 
   for (int i = 0; i < NC; i++) {
     if (!assets[i].geckoId) continue;
@@ -370,109 +411,275 @@ bool fetchLive() {
 
     if (v <= 0) continue;
 
-    float nv = v * assets[i].nominal;
+    nv[i] = v * assets[i].nominal;
+    any++;
+
+    if (!o["rub_24h_change"].isNull()) {
+      ch[i] = o["rub_24h_change"].as<float>();
+      hc[i] = true;
+    }
+  }
+
+  return any > 0;
+}
+
+// Источник 2 (запасной): Binance. USD = USDT/RUB, EUR = EUR/USDT * USDT/RUB.
+bool fetchLiveBinance(float nv[], float ch[], bool hc[]) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(10000);
+
+  if (!http.begin(client,
+      "https://data-api.binance.vision/api/v3/ticker/24hr"
+      "?symbols=%5B%22USDTRUB%22,%22EURUSDT%22%5D"))
+    return false;
+
+  http.addHeader("User-Agent", "esp32-currency-tracker");
+
+  int code = http.GET();
+
+  if (code != 200) {
+    Serial.printf("Binance http error %d\n", code);
+    http.end();
+    return false;
+  }
+
+  JsonDocument filter;
+  filter[0]["symbol"] = true;
+  filter[0]["lastPrice"] = true;
+  filter[0]["priceChangePercent"] = true;
+
+  JsonDocument doc;
+  DeserializationError err =
+      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+
+  if (err) {
+    Serial.printf("Binance json error: %s\n", err.c_str());
+    return false;
+  }
+
+  float usdRub = 0, usdPct = 0, eurUsd = 0, eurPct = 0;
+
+  for (JsonObject o : doc.as<JsonArray>()) {
+    const char* sym = o["symbol"] | "";
+    float price = atof(o["lastPrice"] | "0");
+    float pct = atof(o["priceChangePercent"] | "0");
+
+    if (!strcmp(sym, "USDTRUB")) { usdRub = price; usdPct = pct; }
+    else if (!strcmp(sym, "EURUSDT")) { eurUsd = price; eurPct = pct; }
+  }
+
+  if (usdRub <= 0) return false;
+
+  int any = 0;
+
+  for (int i = 0; i < NC; i++) {
+    if (!assets[i].geckoId) continue;
+
+    if (!strcmp(assets[i].code, "USD")) {
+      nv[i] = usdRub * assets[i].nominal;
+      ch[i] = usdPct;
+      hc[i] = true;
+      any++;
+    } else if (!strcmp(assets[i].code, "EUR") && eurUsd > 0) {
+      nv[i] = eurUsd * usdRub * assets[i].nominal;
+      ch[i] = ((1.0f + eurPct / 100.0f) * (1.0f + usdPct / 100.0f) - 1.0f) * 100.0f;
+      hc[i] = true;
+      any++;
+    }
+  }
+
+  return any > 0;
+}
+
+// Живой курс: сначала CoinGecko, если не ответил — Binance.
+bool fetchLive() {
+  float nv[NC];
+  float ch[NC];
+  bool hc[NC];
+
+  for (int i = 0; i < NC; i++) {
+    nv[i] = 0;
+    ch[i] = 0;
+    hc[i] = false;
+  }
+
+  uint8_t src = 0;
+
+  if (fetchLiveGecko(nv, ch, hc)) src = 1;
+  else if (fetchLiveBinance(nv, ch, hc)) src = 2;
+  else return false;
+
+  int updated = 0;
+
+  // единственное место, где живой курс попадает в общие данные
+  LOCK();
+  for (int i = 0; i < NC; i++) {
+    if (nv[i] <= 0) continue;
 
     if (assets[i].live > 0) {
-      float d = nv - assets[i].live;
+      float d = nv[i] - assets[i].live;
       if (d > 0.0001f) assets[i].liveDir = 1;
       else if (d < -0.0001f) assets[i].liveDir = -1;
     }
 
-    assets[i].live = nv;
+    assets[i].live = nv[i];
 
-    if (!o["rub_24h_change"].isNull()) {
-      assets[i].change24 = o["rub_24h_change"].as<float>();
+    if (hc[i]) {
+      assets[i].change24 = ch[i];
       assets[i].hasChange = true;
     }
 
     updated++;
   }
+  UNLOCK();
 
-  Serial.printf("Live ok, updated: %d\n", updated);
+  liveSrc = src;
+  Serial.printf("Live ok (%s), updated: %d\n", src == 1 ? "CoinGecko" : "Binance", updated);
   return updated > 0;
 }
 
-void connectWifi(bool ui = true) {
-  if (ui) showMessage("Connecting WiFi...");
+// подключение к Wi-Fi и синхронизация времени; ждёт через vTaskDelay,
+// поэтому на экран и кнопки это никак не влияет
+bool netWifiUp() {
+  if (WiFi.status() == WL_CONNECTED) return true;
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   uint32_t t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < 15000)
-    delay(200);
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  if (time(nullptr) < 1700000000) {
     configTime(TZ_OFFSET_H * 3600, 0, "pool.ntp.org", "time.google.com");
 
     t = millis();
     while (time(nullptr) < 1700000000 && millis() - t < 4000)
-      delay(100);
-  }
-}
-
-bool ensureWifi(bool quiet = false) {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  if (quiet) return false;
-
-  connectWifi();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    showMessage("No WiFi");
-    delay(1500);
-    return false;
+      vTaskDelay(pdMS_TO_TICKS(100));
   }
 
   return true;
 }
 
-void refreshHistory() {
-  lastHist = millis();
-
-  if (!ensureWifi()) return;
-
+bool doHistory() {
   busy = BUSY_HIST;
+  histProgress = 0;
+  dataDirty = true;
+
   bool ok = fetchCbr();
-  busy = BUSY_NONE;
 
   if (ok) {
-    lastUpdate = clockStr();
+    String stamp = clockStr();
+
+    LOCK();
+    lastUpdate = stamp;
     histOkMs = millis();
     histCached = false;
+    UNLOCK();
+
+    histFail = false;
     saveCache();
   } else {
-    showMessage("History failed", "using last data");
-    delay(1500);
+    histFail = true;
   }
+
+  busy = BUSY_NONE;
+  dataDirty = true;
+  return ok;
 }
 
-bool refreshLive(bool quiet = false) {
+bool doLive() {
   lastLive = millis();
 
   if (!LIVE_FIAT) return false;
-  if (!ensureWifi(quiet)) return false;
-
-  if (!quiet) showMessage("Updating rates...");
 
   busy = BUSY_LIVE;
-
-  if (quiet && showStatus) draw();
+  dataDirty = true;
 
   bool ok = fetchLive();
-  busy = BUSY_NONE;
 
   if (ok) {
-    lastUpdate = clockStr();
+    String stamp = clockStr();
+
+    LOCK();
+    lastUpdate = stamp;
     liveOkMs = millis();
-    return true;
+    UNLOCK();
+
+    liveFail = false;
+  } else {
+    liveFail = true;
   }
 
-  if (!quiet) {
-    showMessage("Live update failed", "using CBR rates");
-    delay(1200);
-  }
-
-  return false;
+  busy = BUSY_NONE;
+  dataDirty = true;
+  return ok;
 }
+
+void netTask(void*) {
+  bool first = true;
+  bool needHist = true;
+  bool needLive = true;
+  uint32_t lastHistT = 0;
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      busy = BUSY_WIFI;
+      dataDirty = true;
+
+      bool ok = netWifiUp();
+
+      busy = BUSY_NONE;
+      dataDirty = true;
+
+      if (!ok) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        continue;
+      }
+    }
+
+    // кэш свежий — историю при старте перекачивать не нужно
+    if (first) {
+      first = false;
+
+      time_t now = time(nullptr);
+      bool fresh = haveCache && cacheEpoch > 0 && now > 1700000000 &&
+                   (uint32_t)now - cacheEpoch < HIST_MS / 1000;
+
+      if (fresh) {
+        needHist = false;
+        lastHistT = millis();
+
+        LOCK();
+        histCached = true;
+        UNLOCK();
+      }
+    }
+
+    if (needHist || millis() - lastHistT > HIST_MS) {
+      needHist = false;
+      lastHistT = millis();
+
+      // не получилось — повторим через 30 секунд, а не через 6 часов
+      if (!doHistory()) lastHistT = millis() - HIST_MS + 30000UL;
+    }
+
+    if (needLive || millis() - lastLive > LIVE_MS) {
+      needLive = false;
+      doLive();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
+}
+
+// ================= ЭКРАНЫ (только из loop()) =================
 
 void drawRate() {
   Asset& a = assets[curIdx];
@@ -483,7 +690,7 @@ void drawRate() {
   float now = currentValue(a);
 
   if (now <= 0) {
-    showMessage("No data", "wait for update...");
+    noData();
     return;
   }
 
@@ -564,7 +771,7 @@ void drawChart() {
   display.setTextSize(1);
 
   if (a.count < 2) {
-    showMessage("No history yet", "wait for update...");
+    noData();
     return;
   }
 
@@ -660,7 +867,7 @@ void drawConverter() {
   float cur = currentValue(a);
 
   if (cur <= 0 || a.nominal <= 0) {
-    showMessage("No data", "wait for update...");
+    noData();
     return;
   }
 
@@ -676,28 +883,34 @@ void drawConverter() {
   display.setCursor(128 - strlen(idx) * 6, 0);
   display.print(idx);
 
-  const char* from = convRev ? "RUB" : a.code;
-  const char* to = convRev ? a.code : "RUB";
+  float res = amt * perUnit;            // amt единиц валюты -> рубли
 
-  float res = convRev ? amt / perUnit : amt * perUnit;
-
-  display.setCursor(0, 12);
-  display.printf("%ld %s =", amt, from);
+  display.setCursor(0, 10);
+  display.printf("%ld %s =", amt, a.code);
 
   display.setTextSize(2);
-  display.setCursor(0, 24);
+  display.setCursor(0, 20);
   display.print(fmtMoney(res));
 
   display.setTextSize(1);
-  display.setCursor(0, 44);
-  display.print(to);
+  display.setCursor(0, 38);
+  display.print("RUB");
 
   String r = "@" + fmt(perUnit);
-  display.setCursor(128 - r.length() * 6, 44);
+  display.setCursor(128 - r.length() * 6, 38);
   display.print(r);
 
-  display.setCursor(0, 56);
-  display.print("hold>:sum  hold<:flip");
+  // обратное направление всегда на экране: сколько валюты за amt рублей
+  float back = amt / perUnit;
+  char line[32];
+  snprintf(line, sizeof(line), "%ld RUB=%s %s", amt, fmtMoney(back).c_str(), a.code);
+
+  if (strlen(line) > 21)
+    snprintf(line, sizeof(line), "%ld RUB=%.0f %s", amt, back, a.code);
+
+  display.drawFastHLine(0, 48, 128, SSD1306_WHITE);
+  display.setCursor(0, 53);
+  display.print(line);
 }
 
 const char* modeName() {
@@ -742,9 +955,13 @@ void drawStatus() {
 
   display.setCursor(0, 24);
 
-  if (busy == BUSY_LIVE) {
+  Busy b = busy;
+
+  if (b == BUSY_WIFI) {
+    display.print("Data: connecting");
+  } else if (b == BUSY_LIVE) {
     display.print("Data: updating live");
-  } else if (busy == BUSY_HIST) {
+  } else if (b == BUSY_HIST) {
     display.print("Data: loading hist");
   } else if (LIVE_FIAT) {
     long left = ((long)LIVE_MS - (long)(millis() - lastLive)) / 1000;
@@ -754,30 +971,40 @@ void drawStatus() {
     display.print("Data: idle");
   }
 
-  if (busy != BUSY_NONE) display.fillCircle(121, 27, 3, SSD1306_WHITE);
+  if (b != BUSY_NONE) display.fillCircle(121, 27, 3, SSD1306_WHITE);
 
   display.setCursor(0, 34);
 
   if (liveOkMs)
-    display.printf("Live: %s ago", agoStr(millis() - liveOkMs).c_str());
+    display.printf("Live: %s ago%s%s", agoStr(millis() - liveOkMs).c_str(),
+                   liveSrc == 1 ? " CG" : liveSrc == 2 ? " BN" : "",
+                   liveFail ? " !" : "");
   else
-    display.print("Live: --");
+    display.print(liveFail ? "Live: -- fail" : "Live: --");
 
   display.setCursor(0, 44);
 
   if (histOkMs)
-    display.printf("Hist: %s ago", agoStr(millis() - histOkMs).c_str());
+    display.printf("Hist: %s ago%s", agoStr(millis() - histOkMs).c_str(),
+                   histFail ? " !" : "");
+  else if (histCached)
+    display.print("Hist: cached");
   else
-    display.print(histCached ? "Hist: cached" : "Hist: --");
+    display.print(histFail ? "Hist: -- fail" : "Hist: --");
 
   display.setCursor(0, 54);
   display.printf("Mode: %s %s %d/%d",
                  modeName(), assets[curIdx].code, curIdx + 1, NC);
 }
 
+// render() читает общие данные, поэтому идёт под мьютексом;
+// сетевая задача держит его лишь на время короткой записи результата
 void render() {
+  LOCK();
+
   if (showStatus) {
     drawStatus();
+    UNLOCK();
     return;
   }
 
@@ -786,6 +1013,11 @@ void render() {
     case VIEW_CONV: drawConverter(); break;
     default: drawRate(); break;
   }
+
+  // мигающая точка в правом верхнем углу: в фоне идёт загрузка
+  if (dotShown) display.fillCircle(125, 11, 2, SSD1306_WHITE);
+
+  UNLOCK();
 }
 
 void draw() {
@@ -830,23 +1062,21 @@ void drawAnimated(int dir) {
   display.display();
 }
 
-#define LONG_MS 600
-
-enum BtnEvent { EV_NONE, EV_SHORT, EV_LONG };
-
 struct Btn {
   int pin;
   bool last;
   uint32_t t;
-  uint32_t downAt;
-  bool longFired;
 };
 
-Btn bNext = {BTN_NEXT, HIGH, 0, 0, false};
-Btn bView = {BTN_VIEW, HIGH, 0, 0, false};
-Btn bPrev = {BTN_PREV, HIGH, 0, 0, false};
+Btn bNext = {BTN_NEXT, HIGH, 0};
+Btn bPrev = {BTN_PREV, HIGH, 0};
+Btn bView = {BTN_VIEW, HIGH, 0};
+Btn bUp = {BTN_UP, HIGH, 0};
+Btn bDown = {BTN_DOWN, HIGH, 0};
+Btn bStatus = {BTN_STATUS, HIGH, 0};
 
-BtnEvent pollBtn(Btn& b) {
+// true один раз в момент нажатия (с защитой от дребезга)
+bool pollBtn(Btn& b) {
   bool state = digitalRead(b.pin);
   uint32_t now = millis();
 
@@ -854,20 +1084,10 @@ BtnEvent pollBtn(Btn& b) {
     b.t = now;
     b.last = state;
 
-    if (state == LOW) {
-      b.downAt = now;
-      b.longFired = false;
-    } else if (!b.longFired) {
-      return EV_SHORT;
-    }
+    if (state == LOW) return true;
   }
 
-  if (b.last == LOW && !b.longFired && now - b.downAt > LONG_MS) {
-    b.longFired = true;
-    return EV_LONG;
-  }
-
-  return EV_NONE;
+  return false;
 }
 
 void setup() {
@@ -876,6 +1096,9 @@ void setup() {
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_VIEW, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_STATUS, INPUT_PULLUP);
 
   Wire.begin(21, 22);
   Wire.setClock(400000);
@@ -886,39 +1109,31 @@ void setup() {
   }
 
   display.clearDisplay();
+
+  dataMux = xSemaphoreCreateMutex();
+
+  // кэш читаем до старта сети, чтобы никто не писал в данные одновременно
+  haveCache = loadCache(cacheEpoch);
+
+  // сеть стартует в фоне на ядре 0 (loop() работает на ядре 1)
+  // приоритет 0 (как у IDLE0), иначе тяжёлый TLS не даёт idle-задаче сбросить watchdog
+  xTaskCreatePinnedToCore(netTask, "net", 20480, nullptr, 0, nullptr, 0);
+
   splash();
-
-  uint32_t cacheEpoch = 0;
-  bool haveCache = loadCache(cacheEpoch);
-
-  if (haveCache) draw();
-
-  connectWifi(!haveCache);
-
-  time_t now = time(nullptr);
-
-  bool fresh = haveCache && cacheEpoch > 0 && now > 1700000000 &&
-               (uint32_t)now - cacheEpoch < HIST_MS / 1000;
-
-  if (fresh) {
-    lastHist = millis();
-    histCached = true;
-  } else {
-    refreshHistory();
-  }
-
-  refreshLive();
 
   lastInput = millis();
   draw();
 }
 
 void loop() {
-  BtnEvent en = pollBtn(bNext);
-  BtnEvent ep = pollBtn(bPrev);
-  BtnEvent ev = pollBtn(bView);
+  bool en = pollBtn(bNext);
+  bool ep = pollBtn(bPrev);
+  bool ev = pollBtn(bView);
+  bool eu = pollBtn(bUp);
+  bool ed = pollBtn(bDown);
+  bool es = pollBtn(bStatus);
 
-  bool any = (en != EV_NONE || ep != EV_NONE || ev != EV_NONE);
+  bool any = en || ep || ev || eu || ed || es;
 
   if (any) {
     lastInput = millis();
@@ -926,26 +1141,27 @@ void loop() {
   }
 
   if (any && showStatus) {
+    // любая кнопка закрывает экран статуса
     showStatus = false;
     drawAnimated(-1);
-  } else if (ev == EV_LONG) {
+  } else if (es) {
     showStatus = true;
     drawAnimated(+1);
-  } else if (ev == EV_SHORT) {
+  } else if (ev) {
     viewMode = (ViewMode)((viewMode + 1) % 3);
     drawAnimated(+1);
-  } else if (en == EV_LONG && viewMode == VIEW_CONV) {
-    convAmtIdx = (convAmtIdx + 1) % CONV_N;
-    draw();
-  } else if (ep == EV_LONG && viewMode == VIEW_CONV) {
-    convRev = !convRev;
-    draw();
-  } else if (en != EV_NONE) {
+  } else if (en) {
     curIdx = (curIdx + 1) % NC;
     drawAnimated(+1);
-  } else if (ep != EV_NONE) {
+  } else if (ep) {
     curIdx = (curIdx + NC - 1) % NC;
     drawAnimated(-1);
+  } else if (eu && viewMode == VIEW_CONV) {
+    convAmtIdx = min(convAmtIdx + 1, CONV_N - 1);
+    draw();
+  } else if (ed && viewMode == VIEW_CONV) {
+    convAmtIdx = max(convAmtIdx - 1, 0);
+    draw();
   }
 
   if (!autoMode && !showStatus && viewMode != VIEW_CONV &&
@@ -967,13 +1183,17 @@ void loop() {
     lastAuto = millis();
   }
 
-  if (millis() - lastLive > LIVE_MS) {
-    bool ok = refreshLive(true);
-    if (ok || showStatus) draw();
+  // сеть принесла новые данные или сменила состояние — перерисовать
+  if (dataDirty) {
+    dataDirty = false;
+    draw();
   }
 
-  if (millis() - lastHist > HIST_MS) {
-    refreshHistory();
+  // мигание точки, пока в фоне идёт загрузка
+  bool wantDot = (busy != BUSY_NONE) && ((millis() / 400) & 1);
+
+  if (wantDot != dotShown) {
+    dotShown = wantDot;
     draw();
   }
 
@@ -981,5 +1201,6 @@ void loop() {
     lastStatusDraw = millis();
     draw();
   }
-}
 
+  delay(2);
+}
